@@ -1,0 +1,18 @@
+[project]
+name = "claude-recall"
+version = "0.1.0"
+description = "Find and resume Claude Code sessions by describing what you were doing."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Jason Madigan", email = "jason@jasonmadigan.com" }]
+keywords = ["claude", "claude-code", "sessions", "resume"]
+
+[project.scripts]
+ccrecall = "claude_recall:main"
+
+[project.urls]
+Homepage = "https://github.com/jasonmadigan/claude-recall"
+
+[tool.setuptools]
+py-modules = ["claude_recall"]

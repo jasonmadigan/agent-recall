@@ -1,0 +1,14 @@
+{
+  "name": "find-session",
+  "version": "0.1.0",
+  "description": "Find and resume an earlier Claude Code session by describing what you were doing.",
+  "author": {
+    "name": "Jason Madigan",
+    "email": "jason@jasonmadigan.com",
+    "url": "https://github.com/jasonmadigan"
+  },
+  "homepage": "https://github.com/jasonmadigan/claude-recall",
+  "repository": "https://github.com/jasonmadigan/claude-recall",
+  "license": "MIT",
+  "keywords": ["claude-code", "sessions", "resume", "search"]
+}
