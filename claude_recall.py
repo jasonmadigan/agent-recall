@@ -567,6 +567,33 @@ def resolve_hit(by_id: dict[str, Hit], sid: str) -> Hit | None:
     return None
 
 
+def picker_prompt_path() -> Path:
+    return Path(__file__).resolve().parent / "skills" / "find-session" / "references" / "pick-session.md"
+
+
+def build_picker_prompt(query: str, payload: list[dict], limit: int) -> str:
+    path = picker_prompt_path()
+    try:
+        template = path.read_text(encoding="utf-8")
+    except OSError:
+        template = (
+            "Rank candidate Claude Code sessions for resume.\n\n"
+            "## Query\n\n{{QUERY}}\n\n"
+            "## Candidates\n\n{{SESSIONS_JSON}}\n\n"
+            "## Rules\n\n"
+            "Prefer the session that actually did the work, not one that later "
+            "asked to find it, and not a drive-by mention.\n\n"
+            "## Output\n\n"
+            'Return ONLY JSON: {"results": [{"id": "<session-id>", "reason": "<one line>"}]}. '
+            "At most {{LIMIT}} results.\n"
+        )
+    return (
+        template.replace("{{QUERY}}", query)
+        .replace("{{SESSIONS_JSON}}", json.dumps(payload, indent=2))
+        .replace("{{LIMIT}}", str(limit))
+    )
+
+
 def claude_find(
     hits: list[Hit],
     query: str,
@@ -591,20 +618,7 @@ def claude_find(
                 "humans": s.humans,
             }
         )
-    prompt = (
-        "Choose which Claude Code session(s) the user wants to resume.\n"
-        f"Query: {query}\n\n"
-        "Sessions (JSON):\n"
-        f"{json.dumps(payload, indent=2)}\n\n"
-        "Prefer the session that actually did the work, not one that later "
-        "asked to find it, and not a drive-by mention. Implementation work "
-        "usually has a first prompt that is a build/fix request, a matching "
-        "git branch, and more than a couple of user turns.\n"
-        "Return ONLY JSON: "
-        '{"results": [{"id": "<session-id>", "reason": "<one line>"}]}. '
-        "Best match first. At most "
-        f"{limit} results. Omit sessions that are clearly unrelated."
-    )
+    prompt = build_picker_prompt(query, payload, limit)
     cmd = [
         claude_bin,
         "-p",
@@ -764,7 +778,7 @@ def lookup_id(sessions: list[Session], token: str) -> Session | None:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="ccrecall",
-        description="Find a Claude Code session by describing what you were doing. Runs claude to pick among local transcripts.",
+        description="Find a Claude Code session by describing what you were doing. Heuristics shortlist locally, then a picker prompt ranks with Claude.",
     )
     p.add_argument("query", nargs="*", help="Natural-language description or session id prefix")
     p.add_argument("--all", action="store_true", help="Search every project, not just this directory")

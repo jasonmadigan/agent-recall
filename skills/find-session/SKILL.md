@@ -6,11 +6,11 @@ argument-hint: "[--all] [--resume] <what you were doing>"
 
 # Find session
 
-Load a catalog of local Claude Code sessions, then **you** pick the one that matches the user's description. Do not spawn another `claude -p` — this session is the ranker.
+Shortlist local Claude Code sessions with heuristics, then rank them with the picker prompt. Do not spawn another `claude -p` — this session is the ranker.
 
-## Run
+## 1. Heuristic catalog
 
-Use `--fast --json` so the CLI only reads transcripts and does not call Claude again:
+Use `--fast --json` so the CLI only reads transcripts:
 
 ```bash
 if command -v ccrecall >/dev/null 2>&1; then
@@ -26,21 +26,17 @@ If `$ARGUMENTS` is empty, ask what they were doing, then rerun.
 
 Pass `--all` when they did not specify a repo, or when they say the work might be in another project.
 
-## Pick
+## 2. Rank with the picker prompt
 
-From the JSON results, choose the session that **actually did the work**:
-
-- Prefer a first prompt that is a build/fix/implement request, a matching git branch, and more than a couple of user turns.
-- Downrank sessions whose first prompt is itself "find me the session…".
-- Downrank drive-by mentions (one question about the topic, no follow-through).
+Read `references/pick-session.md` (same directory tree as this skill). Treat `$ARGUMENTS` as the query and the CLI JSON as the candidate list. Follow that file's rules and output format, then present the ranked sessions to the user as a readable list (not raw JSON).
 
 ## Present results
 
-Print a short ranked list (your ranking, not the keyword scores). For each hit:
+For each hit:
 
 - date, cwd, git branch
 - title or first prompt (one line)
-- one-line reason
+- one-line reason from the picker
 - session id
 - the exact resume command: `claude --resume <session_id>`
 

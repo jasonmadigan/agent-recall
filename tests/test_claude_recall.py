@@ -263,6 +263,19 @@ class ClaudeParseTests(unittest.TestCase):
         picked = cr.parse_claude_results('["cccccccc-3333-3333-3333-333333333333"]')
         self.assertEqual(picked[0]["id"], "cccccccc-3333-3333-3333-333333333333")
 
+    def test_picker_prompt_fills_placeholders(self):
+        text = cr.build_picker_prompt(
+            "mcp inspector PoC",
+            [{"id": "aaaaaaaa-1111-1111-1111-111111111111", "title": "Build"}],
+            3,
+        )
+        self.assertIn("mcp inspector PoC", text)
+        self.assertIn("aaaaaaaa-1111-1111-1111-111111111111", text)
+        self.assertIn("3", text)
+        self.assertNotIn("{{QUERY}}", text)
+        self.assertNotIn("{{SESSIONS_JSON}}", text)
+        self.assertNotIn("{{LIMIT}}", text)
+
 
 if __name__ == "__main__":
     unittest.main()
