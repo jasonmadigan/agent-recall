@@ -166,7 +166,7 @@ class RankingTests(unittest.TestCase):
         }
         buf = io.StringIO()
         with mock.patch.dict(os.environ, env, clear=False), mock.patch("sys.stdout", buf):
-            rc = cr.main(["--json", "--here", self.here, "auth middleware"])
+            rc = cr.main(["--fast", "--json", "--here", self.here, "auth middleware"])
         self.assertEqual(rc, 0)
         payload = json.loads(buf.getvalue())
         self.assertEqual(
@@ -207,6 +207,61 @@ class ScopeTests(unittest.TestCase):
         )
         sessions = cr.build_index(root, cache, rebuild=True)
         self.assertEqual(sessions[0].branch, "poc/mcp-inspector-direct")
+
+
+class ClaudeParseTests(unittest.TestCase):
+    def test_parse_wrapped_cli_json(self):
+        raw = json.dumps(
+            {
+                "type": "result",
+                "result": json.dumps(
+                    {
+                        "results": [
+                            {
+                                "id": "aaaaaaaa-1111-1111-1111-111111111111",
+                                "reason": "Built the PoC; matching branch.",
+                            }
+                        ]
+                    }
+                ),
+            }
+        )
+        picked = cr.parse_claude_results(raw)
+        self.assertEqual(picked[0]["id"], "aaaaaaaa-1111-1111-1111-111111111111")
+        self.assertIn("PoC", picked[0]["reason"])
+
+    def test_parse_fenced_object(self):
+        text = (
+            "```json\n"
+            '{"results": [{"id": "bbbbbbbb-2222-2222-2222-222222222222", "reason": "mention"}]}\n'
+            "```"
+        )
+        picked = cr.parse_claude_results(text)
+        self.assertEqual(len(picked), 1)
+        self.assertTrue(picked[0]["id"].startswith("bbbbbbbb"))
+
+    def test_ignores_cli_stream_envelope(self):
+        raw = json.dumps(
+            [
+                {
+                    "type": "system",
+                    "subtype": "init",
+                    "session_id": "09f8cef7-db77-4013-b390-738edfd760b4",
+                },
+                {
+                    "type": "result",
+                    "result": '{"results": [{"id": "aaaaaaaa-1111-1111-1111-111111111111", "reason": "Built the PoC"}]}',
+                },
+            ]
+        )
+        picked = cr.parse_claude_results(raw)
+        self.assertEqual(len(picked), 1)
+        self.assertTrue(picked[0]["id"].startswith("aaaaaaaa"))
+        self.assertNotIn("09f8cef7", picked[0]["id"])
+
+    def test_parse_id_array(self):
+        picked = cr.parse_claude_results('["cccccccc-3333-3333-3333-333333333333"]')
+        self.assertEqual(picked[0]["id"], "cccccccc-3333-3333-3333-333333333333")
 
 
 if __name__ == "__main__":

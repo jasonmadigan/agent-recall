@@ -9,6 +9,7 @@ import math
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -17,7 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 PROJECTS_ROOT = Path.home() / ".claude" / "projects"
 CACHE_PATH = Path.home() / ".cache" / "claude-recall" / "index-v1.json"
@@ -74,6 +75,7 @@ USER_WEIGHT = 3.0
 BRANCH_WEIGHT = 7.0
 CWD_WEIGHT = 2.0
 PHRASE_BONUS = 10.0
+CLAUDE_CATALOG_CAP = 40
 
 
 @dataclass
@@ -102,6 +104,7 @@ class Hit:
     session: Session
     score: float
     evidence: list[str] = field(default_factory=list)
+    reason: str = ""
 
 
 def encode_project_path(cwd: str) -> str:
@@ -414,6 +417,15 @@ def in_scope(session: Session, here: str | None, all_projects: bool) -> bool:
     return False
 
 
+def scope_sessions(
+    sessions: list[Session], here: str | None, all_projects: bool
+) -> tuple[list[Session], bool]:
+    scoped = [s for s in sessions if in_scope(s, here, all_projects)]
+    if not scoped and here and not all_projects:
+        return sessions, True
+    return scoped, False
+
+
 def search(
     sessions: list[Session],
     query: str,
@@ -422,11 +434,7 @@ def search(
     all_projects: bool,
     limit: int,
 ) -> tuple[list[Hit], bool]:
-    scoped = [s for s in sessions if in_scope(s, here, all_projects)]
-    fell_back = False
-    if not scoped and here and not all_projects:
-        scoped = sessions
-        fell_back = True
+    scoped, fell_back = scope_sessions(sessions, here, all_projects)
     if not query.strip():
         hits = [Hit(session=s, score=0.0) for s in scoped]
         hits.sort(key=lambda h: h.session.modified, reverse=True)
@@ -438,74 +446,216 @@ def search(
     return hits[:limit], fell_back
 
 
-def llm_rerank(hits: list[Hit], query: str, claude_bin: str = "claude") -> list[Hit]:
+def candidate_pool(
+    sessions: list[Session],
+    query: str,
+    *,
+    here: str | None,
+    all_projects: bool,
+    limit: int = CLAUDE_CATALOG_CAP,
+) -> tuple[list[Hit], bool]:
+    scoped, fell_back = scope_sessions(sessions, here, all_projects)
+    recent = sorted(scoped, key=lambda s: s.modified, reverse=True)[:limit]
+    if not query.strip():
+        return [Hit(session=s, score=0.0) for s in recent], fell_back
+    terms, phrases = tokenize_query(query)
+    scored = [score_session(s, query, terms, phrases) for s in scoped]
+    scored.sort(key=lambda h: h.score, reverse=True)
+    by_id: dict[str, Hit] = {}
+    for hit in scored:
+        if hit.score > 0:
+            by_id[hit.session.session_id] = hit
+    for sess in recent:
+        by_id.setdefault(sess.session_id, Hit(session=sess, score=0.0))
+    pool = list(by_id.values())
+    pool.sort(key=lambda h: (h.score, h.session.modified), reverse=True)
+    return pool[:limit], fell_back
+
+
+def _prompt_lines(session: Session, n: int = 4) -> list[str]:
+    lines = [ln.strip() for ln in (session.user_text or "").split("\n") if ln.strip()]
+    return [_one_line(ln, 220) for ln in lines[:n]]
+
+
+def parse_claude_results(text: str) -> list[dict]:
+    text = (text or "").strip()
+    if not text:
+        return []
+    try:
+        outer = json.loads(text)
+    except json.JSONDecodeError:
+        outer = None
+    if outer is not None:
+        extracted = _results_from_payload(outer)
+        if extracted:
+            return extracted
+    text = re.sub(r"^```(?:json)?\s*", "", text)
+    text = re.sub(r"\s*```$", "", text).strip()
+    try:
+        parsed = json.loads(text)
+        extracted = _results_from_payload(parsed)
+        if extracted:
+            return extracted
+    except json.JSONDecodeError:
+        pass
+    obj = re.search(r"\{[^{}]*\"results\"[^{}]*\[.*\]\s*\}", text, re.S)
+    if not obj:
+        obj = re.search(r"\{.*\"results\".*\}", text, re.S)
+    blob = obj.group(0) if obj else None
+    if not blob:
+        arr = re.search(r"\[\s*\{.*\"id\".*\}\s*\]", text, re.S)
+        blob = arr.group(0) if arr else None
+    if not blob:
+        return []
+    try:
+        parsed = json.loads(blob)
+    except json.JSONDecodeError:
+        return []
+    return _results_from_payload(parsed)
+
+
+def _results_from_payload(payload) -> list[dict]:
+    if isinstance(payload, list):
+        if payload and isinstance(payload[0], dict) and payload[0].get("type"):
+            for event in payload:
+                if not isinstance(event, dict) or event.get("type") != "result":
+                    continue
+                inner = event.get("result")
+                if isinstance(inner, str):
+                    return parse_claude_results(inner)
+                return _results_from_payload(inner)
+            return []
+        return _normalize_result_items(payload)
+    if isinstance(payload, dict):
+        if payload.get("type") == "result" and "result" in payload:
+            inner = payload["result"]
+            if isinstance(inner, str):
+                return parse_claude_results(inner)
+            return _results_from_payload(inner)
+        if "results" in payload:
+            return _normalize_result_items(payload["results"])
+    return []
+
+
+def _normalize_result_items(items) -> list[dict]:
+    out: list[dict] = []
+    if not isinstance(items, list):
+        return out
+    for item in items:
+        if isinstance(item, str):
+            out.append({"id": item, "reason": ""})
+            continue
+        if not isinstance(item, dict) or item.get("type"):
+            continue
+        sid = item.get("id")
+        if sid:
+            out.append({"id": str(sid), "reason": str(item.get("reason") or "").strip()})
+    return out
+
+
+def resolve_hit(by_id: dict[str, Hit], sid: str) -> Hit | None:
+    if sid in by_id:
+        return by_id[sid]
+    sid_l = sid.lower()
+    prefix = sid_l.split("-", 1)[0]
+    for key, hit in by_id.items():
+        key_l = key.lower()
+        if key_l == sid_l or key_l.startswith(sid_l) or sid_l.startswith(key_l.split("-")[0]):
+            return hit
+        if prefix and key_l.startswith(prefix):
+            return hit
+    return None
+
+
+def claude_find(
+    hits: list[Hit],
+    query: str,
+    *,
+    limit: int,
+    claude_bin: str = "claude",
+) -> tuple[list[Hit], str | None]:
     if len(hits) < 2:
-        return hits
+        return hits[:limit], None
     payload = []
-    for i, hit in enumerate(hits, 1):
+    for hit in hits:
         s = hit.session
         payload.append(
             {
-                "n": i,
                 "id": s.session_id,
                 "title": s.title,
-                "first_prompt": s.first_prompt[:400],
+                "first_prompt": _one_line(s.first_prompt, 320),
+                "user_prompts": _prompt_lines(s),
                 "branch": s.branch,
                 "cwd": s.cwd,
-                "modified": s.modified,
+                "modified": (s.modified or "")[:10],
                 "humans": s.humans,
-                "heuristic_score": round(hit.score, 2),
             }
         )
     prompt = (
-        "Pick which Claude Code session(s) the user is asking for.\n"
+        "Choose which Claude Code session(s) the user wants to resume.\n"
         f"Query: {query}\n\n"
         "Sessions (JSON):\n"
         f"{json.dumps(payload, indent=2)}\n\n"
-        "Return ONLY a JSON array of session ids, best first. "
         "Prefer the session that actually did the work, not one that later "
-        "asked to find it. Example: [\"abc-...\", \"def-...\"]"
+        "asked to find it, and not a drive-by mention. Implementation work "
+        "usually has a first prompt that is a build/fix request, a matching "
+        "git branch, and more than a couple of user turns.\n"
+        "Return ONLY JSON: "
+        '{"results": [{"id": "<session-id>", "reason": "<one line>"}]}. '
+        "Best match first. At most "
+        f"{limit} results. Omit sessions that are clearly unrelated."
     )
+    cmd = [
+        claude_bin,
+        "-p",
+        "--output-format",
+        "text",
+        "--max-turns",
+        "1",
+        "--effort",
+        "low",
+        "--no-session-persistence",
+        prompt,
+    ]
+    model = os.environ.get("CLAUDE_RECALL_MODEL")
+    if model:
+        cmd[1:1] = ["--model", model]
     try:
         proc = subprocess.run(
-            [claude_bin, "-p", prompt],
+            cmd,
             check=False,
             capture_output=True,
             text=True,
-            timeout=60,
+            timeout=120,
         )
-    except (OSError, subprocess.TimeoutExpired):
-        return hits
+    except subprocess.TimeoutExpired:
+        return hits[:limit], "Claude timed out; falling back to keyword ranking."
+    except OSError as exc:
+        return hits[:limit], f"Could not run claude ({exc}); falling back to keyword ranking."
     if proc.returncode != 0:
-        return hits
-    text = proc.stdout.strip()
-    match = re.search(r"\[[^\]]+\]", text, re.S)
-    if not match:
-        return hits
-    try:
-        ids = json.loads(match.group(0))
-    except json.JSONDecodeError:
-        return hits
-    if not isinstance(ids, list):
-        return hits
+        err = (proc.stderr or proc.stdout or "claude failed").strip().splitlines()
+        detail = err[-1] if err else "claude failed"
+        return hits[:limit], f"{detail}; falling back to keyword ranking."
+    picked = parse_claude_results(proc.stdout)
+    if not picked:
+        return hits[:limit], "Claude returned no parseable picks; falling back to keyword ranking."
     by_id = {h.session.session_id: h for h in hits}
     ordered: list[Hit] = []
     seen: set[str] = set()
-    for item in ids:
-        sid = str(item)
-        hit = by_id.get(sid)
-        if not hit:
-            for key, cand in by_id.items():
-                if key.startswith(sid) or sid.startswith(key.split("-")[0]):
-                    hit = cand
-                    break
-        if hit and hit.session.session_id not in seen:
-            ordered.append(hit)
-            seen.add(hit.session.session_id)
-    for hit in hits:
-        if hit.session.session_id not in seen:
-            ordered.append(hit)
-    return ordered
+    for item in picked:
+        hit = resolve_hit(by_id, item["id"])
+        if not hit or hit.session.session_id in seen:
+            continue
+        hit.reason = item.get("reason") or hit.reason
+        if hit.reason:
+            hit.evidence = [hit.reason, *hit.evidence]
+        ordered.append(hit)
+        seen.add(hit.session.session_id)
+        if len(ordered) >= limit:
+            break
+    if not ordered:
+        return hits[:limit], "Claude's picks did not match any local session; falling back to keyword ranking."
+    return ordered, None
 
 
 def format_hits(hits: list[Hit], query: str) -> str:
@@ -520,11 +670,16 @@ def format_hits(hits: list[Hit], query: str) -> str:
         loc = loc.replace(str(Path.home()), "~")
         title = s.title or _one_line(s.first_prompt, 90) or "(no title)"
         branch = f"  [{s.branch}]" if s.branch else ""
-        lines.append(
-            f"{i:>2}. {hit.score:6.1f}  {s.short_id}  {when}  {loc}{branch}"
-        )
+        if hit.reason:
+            lines.append(f"{i:>2}. {s.short_id}  {when}  {loc}{branch}")
+        else:
+            lines.append(
+                f"{i:>2}. {hit.score:6.1f}  {s.short_id}  {when}  {loc}{branch}"
+            )
         lines.append(f"    {title}")
-        if hit.evidence:
+        if hit.reason:
+            lines.append(f"    {hit.reason}")
+        elif hit.evidence:
             lines.append("    " + "; ".join(hit.evidence[:3]))
         lines.append(f"    claude --resume {s.session_id}")
     return "\n".join(lines)
@@ -538,9 +693,11 @@ def _one_line(text: str, width: int) -> str:
 
 
 def hits_json(hits: list[Hit], query: str, fell_back: bool) -> str:
+    finder = "claude" if any(h.reason for h in hits) else "keyword"
     return json.dumps(
         {
             "query": query,
+            "finder": finder,
             "fell_back_to_all_projects": fell_back,
             "results": [
                 {
@@ -555,6 +712,7 @@ def hits_json(hits: list[Hit], query: str, fell_back: bool) -> str:
                     "created": h.session.created,
                     "humans": h.session.humans,
                     "evidence": h.evidence,
+                    "reason": h.reason,
                     "resume": f"claude --resume {h.session.session_id}",
                 }
                 for i, h in enumerate(hits, 1)
@@ -606,7 +764,7 @@ def lookup_id(sessions: list[Session], token: str) -> Session | None:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="ccrecall",
-        description="Find and resume a Claude Code session by describing what you were doing.",
+        description="Find a Claude Code session by describing what you were doing. Runs claude to pick among local transcripts.",
     )
     p.add_argument("query", nargs="*", help="Natural-language description or session id prefix")
     p.add_argument("--all", action="store_true", help="Search every project, not just this directory")
@@ -616,7 +774,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--resume", action="store_true", help="Resume the top match")
     p.add_argument("--pick", action="store_true", help="Interactive numbered picker, then resume")
     p.add_argument("--id", action="store_true", help="Print only the top session id")
-    p.add_argument("--llm", action="store_true", help="Rerank top matches with `claude -p`")
+    p.add_argument(
+        "--fast",
+        action="store_true",
+        help="Skip Claude; rank with keywords only",
+    )
+    p.add_argument(
+        "--llm",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     p.add_argument("--fork", action="store_true", help="Pass --fork-session when resuming")
     p.add_argument("--reindex", action="store_true", help="Rebuild the session index")
     p.add_argument("--print-cmd", action="store_true", help="Print the resume command instead of execing")
@@ -656,15 +823,38 @@ def main(argv: list[str] | None = None) -> int:
             print(f"No session id starting with {query}", file=sys.stderr)
             return 1
     else:
-        hits, fell_back = search(
-            sessions,
-            query,
-            here=args.here,
-            all_projects=args.all,
-            limit=args.limit,
-        )
-        if args.llm and hits:
-            hits = llm_rerank(hits, query)
+        use_claude = (not args.fast) and bool(query)
+        if use_claude and shutil.which("claude"):
+            pool, fell_back = candidate_pool(
+                sessions,
+                query,
+                here=args.here,
+                all_projects=args.all,
+            )
+            print(f"Asking Claude to pick among {len(pool)} sessions…", file=sys.stderr)
+            hits, err = claude_find(pool, query, limit=args.limit)
+            if err:
+                print(err, file=sys.stderr)
+                hits, fell_back = search(
+                    sessions,
+                    query,
+                    here=args.here,
+                    all_projects=args.all,
+                    limit=args.limit,
+                )
+        else:
+            if use_claude and not shutil.which("claude"):
+                print(
+                    "claude CLI not on PATH; using keyword ranking. Pass --fast to skip Claude.",
+                    file=sys.stderr,
+                )
+            hits, fell_back = search(
+                sessions,
+                query,
+                here=args.here,
+                all_projects=args.all,
+                limit=args.limit,
+            )
 
     if args.json:
         print(hits_json(hits, query, fell_back))

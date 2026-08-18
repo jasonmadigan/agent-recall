@@ -6,19 +6,19 @@ argument-hint: "[--all] [--resume] <what you were doing>"
 
 # Find session
 
-Resolve the user's description to a Claude Code session using the bundled CLI, then show ranked matches.
+Load a catalog of local Claude Code sessions, then **you** pick the one that matches the user's description. Do not spawn another `claude -p` — this session is the ranker.
 
 ## Run
 
-Prefer `ccrecall` on PATH (installed by `./install.sh`). Fall back to the plugin copy of the script:
+Use `--fast --json` so the CLI only reads transcripts and does not call Claude again:
 
 ```bash
 if command -v ccrecall >/dev/null 2>&1; then
-  ccrecall --json $ARGUMENTS
+  ccrecall --fast --json $ARGUMENTS
 elif [ -n "${CLAUDE_PLUGIN_ROOT:-}" ]; then
-  python3 "${CLAUDE_PLUGIN_ROOT}/claude_recall.py" --json $ARGUMENTS
+  python3 "${CLAUDE_PLUGIN_ROOT}/claude_recall.py" --fast --json $ARGUMENTS
 else
-  python3 ~/.local/bin/ccrecall --json $ARGUMENTS
+  python3 ~/.local/bin/ccrecall --fast --json $ARGUMENTS
 fi
 ```
 
@@ -26,12 +26,21 @@ If `$ARGUMENTS` is empty, ask what they were doing, then rerun.
 
 Pass `--all` when they did not specify a repo, or when they say the work might be in another project.
 
+## Pick
+
+From the JSON results, choose the session that **actually did the work**:
+
+- Prefer a first prompt that is a build/fix/implement request, a matching git branch, and more than a couple of user turns.
+- Downrank sessions whose first prompt is itself "find me the session…".
+- Downrank drive-by mentions (one question about the topic, no follow-through).
+
 ## Present results
 
-Print a short ranked list. For each hit:
+Print a short ranked list (your ranking, not the keyword scores). For each hit:
 
-- rank, score, date, cwd, git branch
+- date, cwd, git branch
 - title or first prompt (one line)
+- one-line reason
 - session id
 - the exact resume command: `claude --resume <session_id>`
 
