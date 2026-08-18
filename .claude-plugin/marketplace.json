@@ -1,0 +1,15 @@
+{
+  "name": "claude-recall",
+  "description": "Find and resume Claude Code sessions by describing what you were doing.",
+  "owner": {
+    "name": "Jason Madigan",
+    "email": "jason@jasonmadigan.com"
+  },
+  "plugins": [
+    {
+      "name": "find-session",
+      "source": "./",
+      "description": "Find and resume an earlier Claude Code session by describing what you were doing."
+    }
+  ]
+}

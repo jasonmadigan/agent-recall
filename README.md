@@ -7,20 +7,26 @@ ccrecall "the session that built the mcp inspector PoC"
 ccrecall "mcp inspector" --resume
 ```
 
-Claude Code already has `claude --resume` and `claude --continue`. Those resume **by session id, session name, or an interactive picker**. The picker's search term filters titles/names, not the work you actually did. There is no `claude --resume --prompt "the session where I was…"`.
-
-You also cannot add new top-level flags to the Claude CLI. The supported extension points are **skills, slash commands, and plugins**. This repo ships both:
-
-1. **`ccrecall`** — a standalone CLI you run from any terminal (including when Claude is not open)
-2. **`/find-session`** — a Claude Code skill/command that shells out to the same CLI
-
-## Why not grep?
-
-Keyword tools exist (`claude-grep`/`ccfind`, `claude-chat-search`, `cc-sessions`). They are great when you remember an exact string.
-
-This tool is for the other case: *"the session where I was building X"*. It ranks **first prompt, later user messages, git branch, and title**, downranks sessions whose first prompt is itself a find/resume request, and slightly prefers longer implementation sessions when the query looks like build work.
+`claude --resume` matches a session **id**, a **name**, or the interactive picker's title filter. It does not search by what you were doing. `ccrecall` ranks local transcripts and can exec `claude --resume` for you.
 
 ## Install
+
+From this repository:
+
+```bash
+./install.sh
+```
+
+That symlinks:
+
+- `~/.local/bin/ccrecall` → `claude_recall.py` (`~/.local/bin` must be on `PATH`)
+- `~/.claude/skills/find-session` → this repo's skill
+
+Requires Python 3.9+. The `claude` CLI is only needed for `--resume` and `--llm`.
+
+Start a new Claude Code session so `/find-session` is available.
+
+To clone from GitHub:
 
 ```bash
 git clone https://github.com/jasonmadigan/claude-recall.git
@@ -28,41 +34,46 @@ cd claude-recall
 ./install.sh
 ```
 
-Requires Python 3.9+ and the `claude` CLI on `PATH` (only needed for `--resume` / `--llm`).
+### Optional: Claude Code plugin
 
-`install.sh` will:
-
-- symlink `ccrecall` to `~/.local/bin/ccrecall` (make sure that directory is on `PATH`)
-- symlink the skill to `~/.claude/skills/find-session`
-
-Restart Claude Code (or `/reload`) so `/find-session` appears.
-
-### As a plugin
-
-From this repo:
+`./install.sh` is enough for daily use. To load this repo as a plugin instead (or as well):
 
 ```bash
-claude plugin install --source .
+claude plugin marketplace add /path/to/claude-recall
+claude plugin install find-session@claude-recall
 ```
 
-Or add it as a local marketplace later. The plugin exposes `/find-session`.
+Or for a single invocation: `claude --plugin-dir /path/to/claude-recall`.
 
 ## Usage
 
-```text
+```bash
 ccrecall "the session where I was doing X"
-ccrecall mcp inspector --resume          # jump into the top match
-ccrecall mcp inspector --pick            # numbered picker, then resume
-ccrecall mcp inspector --json            # for scripts / the Claude skill
-ccrecall mcp inspector --all             # every project, not just cwd
-ccrecall mcp inspector --llm             # rerank top hits with `claude -p`
-ccrecall acdb2e31                        # resume by id prefix
+ccrecall                                      # recent sessions in this project
+ccrecall mcp inspector --resume               # jump into the top match
+ccrecall mcp inspector --pick                 # numbered picker, then resume
+ccrecall mcp inspector --all                  # every project, not just cwd
+ccrecall mcp inspector --here ~/Work/other
+ccrecall mcp inspector --json                 # scripts / the Claude skill
+ccrecall mcp inspector --id                   # print the top session id only
+ccrecall mcp inspector --llm                  # rerank top hits with `claude -p`
+ccrecall acdb2e31 --resume                    # look up by id prefix, then resume
 ccrecall mcp inspector --resume --prompt "where did we leave off?"
+ccrecall mcp inspector --resume --fork        # pass --fork-session
+ccrecall mcp inspector --resume --print-cmd   # print the resume command, don't exec
+ccrecall --reindex
 ```
 
-Default search scope is **this directory's Claude project**. Pass `--all` to search every project under `~/.claude/projects/`. If the current directory has no sessions, the CLI falls back to all projects and says so.
+Default scope is **this directory's Claude project**. `--all` searches every project under `~/.claude/projects/`. If cwd has no sessions, the CLI falls back to all projects and prints a note.
 
-`--resume` `cd`s into the session's original working directory (when it still exists) and execs `claude --resume <id>`. Add `--fork` to pass `--fork-session`. `--print-cmd` prints the command instead of execing it.
+`--resume` `cd`s into the session's original working directory (when it still exists) and execs `claude --resume <id>`.
+
+```text
+ 1.  227.9  acdb2e31  2026-08-18  ~/Work/kuadrant-console-plugin  [poc/mcp-inspector-direct]
+    /goal … Let's build this out…
+    first prompt; branch
+    claude --resume acdb2e31-afa2-424e-82cf-7721376c153a
+```
 
 ## Inside Claude Code
 
@@ -70,36 +81,36 @@ Default search scope is **this directory's Claude project**. Pass `--all` to sea
 /find-session the session that built the mcp inspector PoC
 ```
 
-The skill runs `ccrecall --json` and prints ranked matches with a ready `claude --resume <uuid>` line. Ask it to resume one and it will tell you the command (it cannot attach your current TUI to another session; resume happens in a new Claude invocation).
+The skill runs `ccrecall --json` and prints ranked matches with a `claude --resume <uuid>` line. Resuming starts a **new** Claude invocation; it cannot attach the current TUI to another transcript.
 
 ## How it works
 
-Claude Code stores transcripts as JSONL under `~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`.
+Claude Code stores transcripts as JSONL at `~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`.
 
-`ccrecall` indexes those files (skipping `subagents/`) into `~/.cache/claude-recall/index-v1.json`, keyed by path + mtime + size. It extracts:
+`ccrecall` indexes those files (skipping `subagents/`) into `~/.cache/claude-recall/index-v1.json`, keyed by path + mtime + size. It scores:
 
-- first real human prompt (slash-command `<command-args>` counted as the prompt)
+- first real human prompt (slash-command `<command-args>` counts as the prompt)
 - later user messages
-- `aiTitle`, git branch, cwd, timestamps
+- `aiTitle`, git branch, cwd
 
-It does **not** treat tool output as the user's intent. That is why a session that *mentioned* MCP inspector in bash output loses to the session whose first prompt was "let's build this PoC".
-
-Reindex after unusual transcript edits:
+Tool output is ignored, so a session that *mentioned* a topic in bash output loses to the one whose first prompt was "let's build this". Sessions whose first prompt is itself a find/resume request are downranked.
 
 ```bash
-ccrecall --reindex
+ccrecall --reindex    # rebuild the cache after unusual transcript edits
 ```
 
-## Claude CLI notes
+## Related
 
-| You want | Built-in | This tool |
-| --- | --- | --- |
-| Last session in this directory | `claude --continue` | |
-| Picker / name / id | `claude --resume [term]` | `ccrecall <id-prefix>` |
-| Resume and send a follow-up | `claude -r <id> "follow up"` | `ccrecall … --resume --prompt "follow up"` |
-| "The session where I was doing X" | not supported | `ccrecall "…"` |
+| You want | Use |
+| --- | --- |
+| Last session in this directory | `claude --continue` |
+| Picker / name / id | `claude --resume [term]` |
+| Resume and send a follow-up | `claude -r <id> "follow up"` |
+| "The session where I was doing X" | `ccrecall "…"` |
 
-Custom commands live in `~/.claude/commands/` or a plugin's `commands/`. Skills live in `~/.claude/skills/` or a plugin's `skills/`. None of those can add a `claude --resume --prompt` flag; they wrap this CLI instead.
+You cannot add a `claude --resume --prompt "the session where…"` flag. Claude Code extension points are skills, slash commands, and plugins; this repo ships a CLI plus `/find-session`.
+
+Full-text / fzf tools (`claude-grep`/`ccfind`, `claude-chat-search`, `cc-sessions`) are better when you remember an exact string. This one is for intent ranking.
 
 ## Test
 
