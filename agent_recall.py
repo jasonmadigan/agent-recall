@@ -11,11 +11,11 @@ import re
 import shlex
 import shutil
 import sqlite3
-from contextlib import closing
 import subprocess
 import sys
 import tempfile
 import time
+from contextlib import closing
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -90,10 +90,10 @@ BRANCH_WEIGHT = 7.0
 CWD_WEIGHT = 2.0
 PHRASE_BONUS = 10.0
 BODY_WEIGHT = 1.0
-CLAUDE_CATALOG_CAP = 40
+CANDIDATE_LIMIT = 40
 
 # deep scan: raw transcript grep, used when the indexed fields miss. the index
-# only holds titles and human turns, so anything said by claude or printed by a
+# only holds titles and human turns, so anything said by an assistant or printed by a
 # tool is invisible to scoring without this.
 DEEP_TIME_BUDGET = 20.0
 DEEP_MIN_HITS = 3
@@ -165,7 +165,7 @@ def cache_path() -> Path:
 
 
 def codex_homes() -> list[Path]:
-    """Every codex home on this machine, newest-looking first.
+    """Discover Codex homes, including separate work and personal accounts.
 
     A shell wrapper that exports CODEX_HOME (a separate work login, say) leaves
     sessions somewhere ~/.codex never sees, so glob for siblings too. Set
@@ -229,9 +229,16 @@ def json_object(raw: str) -> dict:
 
 def set_human_prompts(session: Session, humans: list[str]) -> None:
     session.first_prompt = humans[0][:FIRST_PROMPT_CAP] if humans else ""
-    session.user_text = "\n".join(humans)[:USER_TEXT_CAP]
+    excerpts: list[str] = []
+    remaining = USER_TEXT_CAP
+    for message in humans:
+        if remaining <= 0:
+            break
+        excerpts.append(message[:remaining])
+        remaining -= len(excerpts[-1]) + 1
+    session.user_text = "\n".join(excerpts)
     session.humans = len(humans)
-    if session.cwd:
+    if session.cwd and not session.project_dir:
         session.project_dir = encode_project_path(session.cwd)
 
 
@@ -430,19 +437,9 @@ def parse_transcript(path: Path) -> Session | None:
                     humans.append(human)
     except OSError:
         return None
-    if humans:
-        sess.first_prompt = humans[0][:FIRST_PROMPT_CAP]
-        blob: list[str] = []
-        size = 0
-        for msg in humans:
-            if size >= USER_TEXT_CAP:
-                break
-            blob.append(msg)
-            size += len(msg) + 1
-        sess.user_text = "\n".join(blob)[:USER_TEXT_CAP]
-        sess.humans = len(humans)
-    elif not sess.title:
+    if not humans and not sess.title:
         return None
+    set_human_prompts(sess, humans)
     return sess
 
 
@@ -527,18 +524,7 @@ def parse_codex_rollout(path: Path, home: Path) -> Session | None:
         return None
     if not humans:
         return None
-    if sess.cwd:
-        sess.project_dir = encode_project_path(sess.cwd)
-    sess.first_prompt = humans[0][:FIRST_PROMPT_CAP]
-    blob: list[str] = []
-    size = 0
-    for msg in humans:
-        if size >= USER_TEXT_CAP:
-            break
-        blob.append(msg)
-        size += len(msg) + 1
-    sess.user_text = "\n".join(blob)[:USER_TEXT_CAP]
-    sess.humans = len(humans)
+    set_human_prompts(sess, humans)
     return sess
 
 
@@ -659,29 +645,13 @@ def tokenize_query(query: str) -> tuple[list[str], list[str]]:
     terms = [t for t in raw if t not in STOPWORDS and len(t) > 1]
     if not terms:
         terms = [t for t in raw if len(t) > 1]
-    phrases: list[str] = []
-    for i in range(len(terms) - 1):
-        phrases.append(f"{terms[i]} {terms[i + 1]}")
-    # keep original 2-grams from the query too (including stopwords) for names
-    words = [t.lower() for t in raw]
-    for i in range(len(words) - 1):
-        phrase = f"{words[i]} {words[i + 1]}"
-        if phrase not in phrases and words[i] not in STOPWORDS and words[i + 1] not in STOPWORDS:
-            phrases.append(phrase)
-    # unique, stable
-    seen: set[str] = set()
-    uniq_terms = []
-    for t in terms:
-        if t not in seen:
-            seen.add(t)
-            uniq_terms.append(t)
-    seen_p: set[str] = set()
-    uniq_phrases = []
-    for p in phrases:
-        if p not in seen_p:
-            seen_p.add(p)
-            uniq_phrases.append(p)
-    return uniq_terms, uniq_phrases
+    phrases = [f"{left} {right}" for left, right in zip(terms, terms[1:])]
+    # Preserve adjacent single-letter names omitted from the individual terms.
+    phrases.extend(
+        f"{left} {right}" for left, right in zip(raw, raw[1:])
+        if left not in STOPWORDS and right not in STOPWORDS
+    )
+    return list(dict.fromkeys(terms)), list(dict.fromkeys(phrases))
 
 
 def _term_count(text: str, term: str) -> int:
@@ -816,13 +786,13 @@ def deep_search(
     phrases: list[str],
     *,
     skip: set[str] | None = None,
-    budget: float | None = None,
+    budget: float = DEEP_TIME_BUDGET,
 ) -> list[Hit]:
     """Newest-first raw scan. Bounded by wall clock so it stays interactive."""
     if not terms and not phrases:
         return []
     skip = skip or set()
-    deadline = time.monotonic() + (DEEP_TIME_BUDGET if budget is None else budget)
+    deadline = time.monotonic() + budget
     found: list[Hit] = []
     ordered = [s for s in sorted(sessions, key=lambda s: s.modified, reverse=True) if s.path not in skip]
     shortlist = _grep_shortlist([s.path for s in ordered if not s.database], terms + phrases, deadline=deadline)
@@ -902,6 +872,7 @@ def search(
     here: str | None,
     all_projects: bool,
     limit: int,
+    deep_budget: float = DEEP_TIME_BUDGET,
 ) -> tuple[list[Hit], bool]:
     scoped, fell_back = scope_sessions(sessions, here, all_projects)
     if not query.strip():
@@ -914,7 +885,7 @@ def search(
     hits.sort(key=lambda h: h.score, reverse=True)
     if len(hits) < DEEP_MIN_HITS:
         known = {h.session.path for h in hits}
-        hits.extend(deep_search(scoped, terms, phrases, skip=known))
+        hits.extend(deep_search(scoped, terms, phrases, skip=known, budget=deep_budget))
         hits.sort(key=lambda h: h.score, reverse=True)
     return hits[:limit], fell_back
 
@@ -925,7 +896,8 @@ def candidate_pool(
     *,
     here: str | None,
     all_projects: bool,
-    limit: int = CLAUDE_CATALOG_CAP,
+    limit: int = CANDIDATE_LIMIT,
+    deep_budget: float = DEEP_TIME_BUDGET,
 ) -> tuple[list[Hit], bool]:
     scoped, fell_back = scope_sessions(sessions, here, all_projects)
     recent = sorted(scoped, key=lambda s: s.modified, reverse=True)[:limit]
@@ -934,16 +906,16 @@ def candidate_pool(
     terms, phrases = tokenize_query(query)
     scored = [score_session(s, query, terms, phrases) for s in scoped]
     scored.sort(key=lambda h: h.score, reverse=True)
-    by_id: dict[str, Hit] = {}
+    by_path: dict[str, Hit] = {}
     for hit in scored:
         if hit.score > 0:
-            by_id[hit.session.path] = hit
-    if len(by_id) < DEEP_MIN_HITS:
-        for hit in deep_search(scoped, terms, phrases, skip=set(by_id)):
-            by_id.setdefault(hit.session.path, hit)
+            by_path[hit.session.path] = hit
+    if len(by_path) < DEEP_MIN_HITS:
+        for hit in deep_search(scoped, terms, phrases, skip=set(by_path), budget=deep_budget):
+            by_path.setdefault(hit.session.path, hit)
     for sess in recent:
-        by_id.setdefault(sess.path, Hit(session=sess, score=0.0))
-    pool = list(by_id.values())
+        by_path.setdefault(sess.path, Hit(session=sess, score=0.0))
+    pool = list(by_path.values())
     pool.sort(key=lambda h: (h.score, h.session.modified), reverse=True)
     return pool[:limit], fell_back
 
@@ -1055,8 +1027,8 @@ def build_picker_prompt(query: str, payload: list[dict], limit: int) -> str:
             "Prefer the session that actually did the work, not one that later "
             "asked to find it, and not a drive-by mention.\n\n"
             "## Output\n\n"
-            'Return ONLY JSON: {"results": [{"id": "<session-id>", "reason": "<one line>"}]}. '
-            "At most {{LIMIT}} results.\n"
+            'Return ONLY JSON: {"results": [{"id": "<candidate-id>", "reason": "<one line>"}]}. '
+            "Use the candidate id exactly as supplied. At most {{LIMIT}} results.\n"
         )
     return (
         template.replace("{{QUERY}}", query)
@@ -1066,12 +1038,7 @@ def build_picker_prompt(query: str, payload: list[dict], limit: int) -> str:
 
 
 def picker_env() -> dict[str, str]:
-    """Run the picker on the personal account, not Vertex.
-
-    Vertex refuses the anthropic publisher models unless data sharing is
-    enabled on the GCP project, which kills ranking with a 403. Set
-    AGENT_RECALL_VERTEX=1 to keep whatever the shell already has.
-    """
+    """Clear Vertex overrides unless AGENT_RECALL_VERTEX is set."""
     env = os.environ.copy()
     if recall_env("VERTEX"):
         return env
@@ -1245,7 +1212,7 @@ def resume_command(session: Session, *, fork: bool = False) -> list[str]:
 
 
 def resume_env(session: Session) -> dict[str, str]:
-    """Codex reads its store from CODEX_HOME; a non-default home must be named."""
+    """Select the same agent data store when resuming a discovered session."""
     if session.source == "opencode" and session.database:
         return {"XDG_DATA_HOME": str(Path(session.database).parent.parent)}
     if session.source != "codex" or not session.agent_home:
@@ -1363,7 +1330,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    global DEEP_TIME_BUDGET
     try:
         deep_budget = float(recall_env("DEEP_SECONDS", "20"))
         if not math.isfinite(deep_budget) or deep_budget < 0:
@@ -1371,7 +1337,6 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError:
         print("AGENT_RECALL_DEEP_SECONDS must be a non-negative number.", file=sys.stderr)
         return 2
-    DEEP_TIME_BUDGET = deep_budget
     query = " ".join(args.query).strip()
     extra = list(args.prompt)
     if extra and extra[0] == "--":
@@ -1404,6 +1369,7 @@ def main(argv: list[str] | None = None) -> int:
                 query,
                 here=args.here,
                 all_projects=args.all,
+                deep_budget=deep_budget,
             )
             print(f"Asking Claude to pick among {len(pool)} sessions…", file=sys.stderr)
             hits, err = claude_find(pool, query, limit=args.limit)
@@ -1414,6 +1380,7 @@ def main(argv: list[str] | None = None) -> int:
                     query,
                     here=args.here,
                     all_projects=args.all,
+                    deep_budget=deep_budget,
                     limit=args.limit,
                 )
         else:
@@ -1427,6 +1394,7 @@ def main(argv: list[str] | None = None) -> int:
                 query,
                 here=args.here,
                 all_projects=args.all,
+                deep_budget=deep_budget,
                 limit=args.limit,
             )
 

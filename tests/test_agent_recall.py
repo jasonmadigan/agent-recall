@@ -263,6 +263,36 @@ class AgentTests(unittest.TestCase):
         import claude_recall
         self.assertIs(claude_recall.Session, ar.Session)
 
+    def test_cli_scan_budget_does_not_change_later_searches(self):
+        path = self.pi_session()
+        with mock.patch.dict(os.environ, {
+            'AGENT_RECALL_PI_DIRS': str(self.root/'pi'),
+            'AGENT_RECALL_DEEP_SECONDS': '0',
+        }):
+            self.assertEqual(self.run_cli('quasar', '--all', '--json')[0], 1)
+        hits, _ = ar.search([ar.parse_pi_session(path)], 'quasar', here=None, all_projects=True, limit=1)
+        self.assertEqual(len(hits), 1)
+        self.assertIn('transcript body', hits[0].evidence[0])
+
+    def test_long_transcripts_keep_prompt_caps_and_full_turn_count(self):
+        messages = ['first ' + 'x' * ar.FIRST_PROMPT_CAP, 'y' * ar.USER_TEXT_CAP, 'last turn']
+        claude = self.write(self.root/'claude.jsonl', [user_msg(text) for text in messages])
+        codex = self.write(self.root/'codex.jsonl', [codex_meta('id', str(self.root)), *[codex_user(text) for text in messages]])
+        pi = self.write(self.root/'pi.jsonl', [
+            {'type': 'session', 'id': 'id', 'cwd': str(self.root)},
+            *[{'type': 'message', 'message': {'role': 'user', 'content': text}} for text in messages],
+        ])
+        for session in [ar.parse_transcript(claude), ar.parse_codex_rollout(codex, self.root), ar.parse_pi_session(pi)]:
+            with self.subTest(source=session.source):
+                self.assertEqual(session.humans, 3)
+                self.assertEqual(session.first_prompt, messages[0][:ar.FIRST_PROMPT_CAP])
+                self.assertEqual(session.user_text, '\n'.join(messages)[:ar.USER_TEXT_CAP])
+
+    def test_query_phrases_keep_single_letter_names_and_stable_order(self):
+        terms, phrases = ar.tokenize_query('x y auth and middleware auth')
+        self.assertEqual(terms, ['auth', 'middleware'])
+        self.assertEqual(phrases, ['auth middleware', 'middleware auth', 'x y', 'y auth'])
+
     def test_deep_scan_passes_remaining_budget_to_grep(self):
         proc = subprocess.CompletedProcess([], 1, '', '')
         with mock.patch.object(ar, '_shortlist_tool', return_value=['rg']), mock.patch.object(ar.time, 'monotonic', return_value=10), mock.patch.object(ar.subprocess, 'run', return_value=proc) as run:

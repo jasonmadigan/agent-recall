@@ -144,7 +144,7 @@ Exit codes: `0` for results or a successful reindex, `1` for no match or an ambi
 python3 -m unittest discover -s tests -v
 ```
 
-See [contributing](CONTRIBUTING.md) for the source layout, test fixtures, and packaging checks, and the [codebase review](docs/codebase-review.md) for bugs found during the multi-agent update.
+See [contributing](CONTRIBUTING.md) for the source layout, test fixtures, and packaging checks.
 
 Storage and command references: [OpenCode CLI](https://opencode.ai/docs/cli/), [OpenCode skills](https://opencode.ai/docs/skills/), [Pi session format](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/docs/session-format.md), [Pi skills](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/docs/skills.md). Resume flags were also checked against the installed CLIs during development.
 

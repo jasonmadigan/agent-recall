@@ -401,6 +401,7 @@ class CodexTests(unittest.TestCase):
         self.assertEqual(cr.resume_env(sess), {"CODEX_HOME": str(self.home)})
         self.assertIn("CODEX_HOME=", cr.display_resume(sess))
 
+    @mock.patch.dict(os.environ, {"CODEX_HOME": ""})
     def test_default_codex_home_needs_no_env(self):
         sess = cr.Session(
             path="x",
