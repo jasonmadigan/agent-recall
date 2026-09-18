@@ -1,18 +1,28 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
 [project]
-name = "claude-recall"
-version = "0.2.0"
-description = "Find and resume Claude Code sessions by describing what you were doing."
+name = "agent-recall"
+version = "0.5.0"
+description = "Find and resume Claude Code, Codex, OpenCode, and Pi sessions by what you were doing."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
 authors = [{ name = "Jason Madigan", email = "jason@jasonmadigan.com" }]
-keywords = ["claude", "claude-code", "sessions", "resume"]
+keywords = ["claude-code", "codex", "opencode", "pi", "sessions", "resume"]
 
 [project.scripts]
-ccrecall = "claude_recall:main"
+agent-recall = "agent_recall:main"
+ccrecall = "agent_recall:main"
 
 [project.urls]
-Homepage = "https://github.com/jasonmadigan/claude-recall"
+Homepage = "https://github.com/jasonmadigan/agent-recall"
+Issues = "https://github.com/jasonmadigan/agent-recall/issues"
 
 [tool.setuptools]
-py-modules = ["claude_recall"]
+py-modules = ["agent_recall", "claude_recall"]
+
+[tool.setuptools.data-files]
+"share/agent-recall/skills/find-session" = ["skills/find-session/SKILL.md"]
+"share/agent-recall/skills/find-session/references" = ["skills/find-session/references/pick-session.md"]

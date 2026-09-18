@@ -11,7 +11,7 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import claude_recall as cr
+import agent_recall as cr
 
 
 def user_msg(text, **kwargs):
@@ -164,6 +164,8 @@ class RankingTests(unittest.TestCase):
             "CLAUDE_PROJECTS_DIR": str(self.root),
             "CLAUDE_RECALL_CACHE": str(self.cache),
             "CLAUDE_RECALL_CODEX_HOMES": "",
+            "AGENT_RECALL_PI_DIRS": "",
+            "AGENT_RECALL_OPENCODE_DBS": "",
         }
         buf = io.StringIO()
         with mock.patch.dict(os.environ, env, clear=False), mock.patch("sys.stdout", buf):
@@ -278,10 +280,6 @@ class ClaudeParseTests(unittest.TestCase):
         self.assertNotIn("{{LIMIT}}", text)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 def codex_meta(session_id, cwd, *, thread_source="user", forked_from=None, branch=None):
     payload = {"id": session_id, "cwd": cwd, "thread_source": thread_source}
     if forked_from:
@@ -366,7 +364,7 @@ class CodexTests(unittest.TestCase):
 
     def test_homes_from_env_override(self):
         with mock.patch.dict(os.environ, {"CLAUDE_RECALL_CODEX_HOMES": str(self.home)}, clear=False):
-            self.assertEqual(cr.codex_homes(), [self.home])
+            self.assertEqual(cr.codex_homes(), [self.home.resolve()])
         with mock.patch.dict(os.environ, {"CLAUDE_RECALL_CODEX_HOMES": ""}, clear=False):
             self.assertEqual(cr.codex_homes(), [])
 
@@ -414,3 +412,7 @@ class CodexTests(unittest.TestCase):
         )
         self.assertEqual(cr.resume_env(sess), {})
         self.assertEqual(cr.display_resume(sess), "codex resume 01a0ae6f-0000-0000-0000-000000000001")
+
+
+if __name__ == "__main__":
+    unittest.main()
