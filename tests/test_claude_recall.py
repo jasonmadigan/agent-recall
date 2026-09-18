@@ -163,6 +163,7 @@ class RankingTests(unittest.TestCase):
         env = {
             "CLAUDE_PROJECTS_DIR": str(self.root),
             "CLAUDE_RECALL_CACHE": str(self.cache),
+            "CLAUDE_RECALL_CODEX_HOMES": "",
         }
         buf = io.StringIO()
         with mock.patch.dict(os.environ, env, clear=False), mock.patch("sys.stdout", buf):
@@ -279,3 +280,137 @@ class ClaudeParseTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def codex_meta(session_id, cwd, *, thread_source="user", forked_from=None, branch=None):
+    payload = {"id": session_id, "cwd": cwd, "thread_source": thread_source}
+    if forked_from:
+        payload["forked_from_id"] = forked_from
+    if branch:
+        payload["git"] = {"branch": branch}
+    return {"timestamp": "2026-09-17T08:15:06.000Z", "type": "session_meta", "payload": payload}
+
+
+def codex_user(text, timestamp="2026-09-17T08:16:00.000Z"):
+    return {
+        "timestamp": timestamp,
+        "type": "response_item",
+        "payload": {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": text}],
+        },
+    }
+
+
+class CodexTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name) / ".codex-work"
+        self.day = self.home / "sessions" / "2026" / "09" / "17"
+        self.day.mkdir(parents=True)
+        self.addCleanup(self.tmp.cleanup)
+
+    def write_rollout(self, name, entries):
+        path = self.day / name
+        with path.open("w", encoding="utf-8") as fh:
+            for entry in entries:
+                fh.write(json.dumps(entry) + "\n")
+        return path
+
+    def test_parses_rollout(self):
+        path = self.write_rollout(
+            "rollout-2026-09-17T09-15-06-01a0ae6f-0000-0000-0000-000000000001.jsonl",
+            [
+                codex_meta("01a0ae6f-0000-0000-0000-000000000001", "/Users/x", branch="main"),
+                codex_user("# AGENTS.md instructions\n<INSTRUCTIONS>noise</INSTRUCTIONS>"),
+                codex_user("$grill-with-docs keep agents in sync with syncthing"),
+                codex_user("second turn"),
+            ],
+        )
+        sess = cr.parse_codex_rollout(path, self.home)
+        self.assertIsNotNone(sess)
+        self.assertEqual(sess.source, "codex")
+        self.assertEqual(sess.session_id, "01a0ae6f-0000-0000-0000-000000000001")
+        self.assertEqual(sess.cwd, "/Users/x")
+        self.assertEqual(sess.branch, "main")
+        self.assertEqual(sess.agent_home, str(self.home))
+        self.assertEqual(sess.humans, 2)
+        self.assertTrue(sess.first_prompt.startswith("$grill-with-docs"))
+        self.assertIn("second turn", sess.user_text)
+
+    def test_skips_subagent_fork(self):
+        path = self.write_rollout(
+            "rollout-2026-09-17T09-18-12-01a0ae71-0000-0000-0000-000000000002.jsonl",
+            [
+                codex_meta(
+                    "01a0ae71-0000-0000-0000-000000000002",
+                    "/Users/x",
+                    thread_source="subagent",
+                    forked_from="01a0ae6f-0000-0000-0000-000000000001",
+                ),
+                codex_user("explore the thing"),
+            ],
+        )
+        self.assertIsNone(cr.parse_codex_rollout(path, self.home))
+
+    def test_skips_rollout_without_human_turns(self):
+        path = self.write_rollout(
+            "rollout-2026-09-17T09-20-00-01a0ae72-0000-0000-0000-000000000003.jsonl",
+            [
+                codex_meta("01a0ae72-0000-0000-0000-000000000003", "/Users/x"),
+                codex_user("<environment_context>\n<cwd>/Users/x</cwd>\n</environment_context>"),
+            ],
+        )
+        self.assertIsNone(cr.parse_codex_rollout(path, self.home))
+
+    def test_homes_from_env_override(self):
+        with mock.patch.dict(os.environ, {"CLAUDE_RECALL_CODEX_HOMES": str(self.home)}, clear=False):
+            self.assertEqual(cr.codex_homes(), [self.home])
+        with mock.patch.dict(os.environ, {"CLAUDE_RECALL_CODEX_HOMES": ""}, clear=False):
+            self.assertEqual(cr.codex_homes(), [])
+
+    def test_build_index_includes_codex(self):
+        self.write_rollout(
+            "rollout-2026-09-17T09-15-06-01a0ae6f-0000-0000-0000-000000000001.jsonl",
+            [
+                codex_meta("01a0ae6f-0000-0000-0000-000000000001", "/Users/x"),
+                codex_user("keep agents in sync"),
+            ],
+        )
+        empty = Path(self.tmp.name) / "projects"
+        empty.mkdir()
+        cache = Path(self.tmp.name) / "index.json"
+        sessions = cr.build_index(empty, cache, rebuild=True, codex_homes=[self.home])
+        self.assertEqual([s.session_id for s in sessions], ["01a0ae6f-0000-0000-0000-000000000001"])
+        # a second pass must reuse the cache rather than re-reading the rollouts
+        again = cr.build_index(empty, cache, codex_homes=[self.home])
+        self.assertEqual(len(again), 1)
+
+    def test_resume_command_names_non_default_home(self):
+        sess = cr.Session(
+            path="x",
+            mtime_ns=0,
+            size=0,
+            session_id="01a0ae6f-0000-0000-0000-000000000001",
+            source="codex",
+            agent_home=str(self.home),
+        )
+        self.assertEqual(
+            cr.resume_command(sess),
+            ["codex", "resume", "01a0ae6f-0000-0000-0000-000000000001"],
+        )
+        self.assertEqual(cr.resume_env(sess), {"CODEX_HOME": str(self.home)})
+        self.assertIn("CODEX_HOME=", cr.display_resume(sess))
+
+    def test_default_codex_home_needs_no_env(self):
+        sess = cr.Session(
+            path="x",
+            mtime_ns=0,
+            size=0,
+            session_id="01a0ae6f-0000-0000-0000-000000000001",
+            source="codex",
+            agent_home=str(Path.home() / ".codex"),
+        )
+        self.assertEqual(cr.resume_env(sess), {})
+        self.assertEqual(cr.display_resume(sess), "codex resume 01a0ae6f-0000-0000-0000-000000000001")

@@ -13,16 +13,17 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
-__version__ = "0.2.0"
+__version__ = "0.4.0"
 
 PROJECTS_ROOT = Path.home() / ".claude" / "projects"
 CACHE_PATH = Path.home() / ".cache" / "claude-recall" / "index-v1.json"
-INDEX_VERSION = 1
+INDEX_VERSION = 2
 
 STOPWORDS = frozenset(
     """
@@ -67,6 +68,17 @@ SKIP_PREFIXES = (
     "A session-scoped Stop hook is now active",
 )
 
+# codex writes rollouts under <CODEX_HOME>/sessions/YYYY/MM/DD/. people run more
+# than one home (work vs personal), so discovery has to look past ~/.codex.
+CODEX_HOME_GLOB = ".codex*"
+SKIP_SOURCE = "skip"
+CODEX_SKIP_PREFIXES = (
+    "# AGENTS.md instructions",
+    "<environment_context>",
+    "<user_instructions>",
+    "<INSTRUCTIONS>",
+)
+
 USER_TEXT_CAP = 24_000
 FIRST_PROMPT_CAP = 2_000
 TITLE_WEIGHT = 8.0
@@ -75,7 +87,23 @@ USER_WEIGHT = 3.0
 BRANCH_WEIGHT = 7.0
 CWD_WEIGHT = 2.0
 PHRASE_BONUS = 10.0
+BODY_WEIGHT = 1.0
 CLAUDE_CATALOG_CAP = 40
+
+# deep scan: raw transcript grep, used when the indexed fields miss. the index
+# only holds titles and human turns, so anything said by claude or printed by a
+# tool is invisible to scoring without this.
+DEEP_TIME_BUDGET = float(os.environ.get("CLAUDE_RECALL_DEEP_SECONDS", "20"))
+DEEP_MIN_HITS = 3
+VERTEX_ENV = (
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLOUD_ML_REGION",
+    "ANTHROPIC_VERTEX_PROJECT_ID",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+)
+PICKER_MODEL = "claude-opus-5"
 
 
 @dataclass
@@ -93,6 +121,8 @@ class Session:
     modified: str = ""
     humans: int = 0
     project_dir: str = ""
+    source: str = "claude"
+    agent_home: str = ""
 
     @property
     def short_id(self) -> str:
@@ -126,6 +156,45 @@ def projects_root() -> Path:
 def cache_path() -> Path:
     override = os.environ.get("CLAUDE_RECALL_CACHE")
     return Path(override) if override else CACHE_PATH
+
+
+def codex_homes() -> list[Path]:
+    """Every codex home on this machine, newest-looking first.
+
+    A shell wrapper that exports CODEX_HOME (a separate work login, say) leaves
+    sessions somewhere ~/.codex never sees, so glob for siblings too. Set
+    CLAUDE_RECALL_CODEX_HOMES to a colon-separated list to override, or to an
+    empty string to skip codex entirely.
+    """
+    override = os.environ.get("CLAUDE_RECALL_CODEX_HOMES")
+    if override is not None:
+        return [Path(p).expanduser() for p in override.split(os.pathsep) if p]
+    found: list[Path] = []
+    env_home = os.environ.get("CODEX_HOME")
+    if env_home:
+        found.append(Path(env_home).expanduser())
+    for candidate in sorted(Path.home().glob(CODEX_HOME_GLOB)):
+        if (candidate / "sessions").is_dir() or (candidate / "archived_sessions").is_dir():
+            found.append(candidate)
+    seen: set[str] = set()
+    homes: list[Path] = []
+    for home in found:
+        key = str(home.resolve()) if home.exists() else str(home)
+        if key in seen or not home.is_dir():
+            continue
+        seen.add(key)
+        homes.append(home)
+    return homes
+
+
+def iter_codex_files(home: Path) -> Iterable[Path]:
+    for sub_dir in ("sessions", "archived_sessions"):
+        base = home / sub_dir
+        if not base.is_dir():
+            continue
+        for path in sorted(base.rglob("*.jsonl")):
+            if path.is_file():
+                yield path
 
 
 def extract_human_text(entry: dict) -> str | None:
@@ -243,6 +312,98 @@ def parse_transcript(path: Path) -> Session | None:
     return sess
 
 
+def extract_codex_human_text(payload: dict) -> str | None:
+    if payload.get("type") != "message" or payload.get("role") != "user":
+        return None
+    content = payload.get("content")
+    if not isinstance(content, list):
+        return None
+    parts = [
+        block.get("text") or ""
+        for block in content
+        if isinstance(block, dict) and block.get("type") in {"input_text", "text"}
+    ]
+    text = "\n".join(parts).strip()
+    if not text:
+        return None
+    # codex replays AGENTS.md and the environment block as the first user turn
+    if text.startswith(CODEX_SKIP_PREFIXES) or "<environment_context>" in text[:400]:
+        return None
+    cleaned = re.sub(r"\s+", " ", TAG_RE.sub(" ", text)).strip()
+    return cleaned or None
+
+
+def parse_codex_rollout(path: Path, home: Path) -> Session | None:
+    """Index one codex rollout. Subagent forks are skipped like claude sidechains."""
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    sess = Session(
+        path=str(path),
+        mtime_ns=st.st_mtime_ns,
+        size=st.st_size,
+        session_id=path.stem,
+        source="codex",
+        agent_home=str(home),
+        modified=datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        ),
+    )
+    humans: list[str] = []
+    try:
+        with path.open(encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if not line.strip():
+                    continue
+                compact = line.replace(": ", ":")
+                if not (
+                    '"session_meta"' in compact
+                    or '"role":"user"' in compact
+                    or not sess.created
+                ):
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                payload = entry.get("payload")
+                if not isinstance(payload, dict):
+                    payload = {}
+                if entry.get("type") == "session_meta":
+                    if payload.get("thread_source") == "subagent" or payload.get("forked_from_id"):
+                        return None
+                    sess.session_id = str(payload.get("id") or sess.session_id)
+                    sess.cwd = str(payload.get("cwd") or "")
+                    git = payload.get("git")
+                    if isinstance(git, dict) and git.get("branch"):
+                        sess.branch = str(git["branch"])
+                if entry.get("timestamp"):
+                    if not sess.created:
+                        sess.created = entry["timestamp"]
+                    sess.modified = entry["timestamp"]
+                human = extract_codex_human_text(payload)
+                if human:
+                    humans.append(human)
+    except OSError:
+        return None
+    if not humans:
+        return None
+    if sess.cwd:
+        sess.project_dir = encode_project_path(sess.cwd)
+    sess.first_prompt = humans[0][:FIRST_PROMPT_CAP]
+    blob: list[str] = []
+    size = 0
+    for msg in humans:
+        if size >= USER_TEXT_CAP:
+            break
+        blob.append(msg)
+        size += len(msg) + 1
+    sess.user_text = "\n".join(blob)[:USER_TEXT_CAP]
+    sess.humans = len(humans)
+    return sess
+
+
 def iter_session_files(root: Path) -> Iterable[Path]:
     if not root.is_dir():
         return
@@ -296,11 +457,19 @@ def save_cache(path: Path, sessions: dict[str, Session]) -> None:
         raise
 
 
-def build_index(root: Path, cache_file: Path, rebuild: bool = False) -> list[Session]:
+def build_index(
+    root: Path,
+    cache_file: Path,
+    rebuild: bool = False,
+    codex_homes: Iterable[Path] = (),
+) -> list[Session]:
     cached = {} if rebuild else load_cache(cache_file)
     current: dict[str, Session] = {}
     changed = rebuild
-    for path in iter_session_files(root):
+    sources: list[tuple[Path, Path | None]] = [(path, None) for path in iter_session_files(root)]
+    for home in codex_homes:
+        sources.extend((path, home) for path in iter_codex_files(home))
+    for path, home in sources:
         key = str(path)
         try:
             st = path.stat()
@@ -310,15 +479,19 @@ def build_index(root: Path, cache_file: Path, rebuild: bool = False) -> list[Ses
         if old and old.mtime_ns == st.st_mtime_ns and old.size == st.st_size:
             current[key] = old
             continue
-        parsed = parse_transcript(path)
-        if parsed:
-            current[key] = parsed
-            changed = True
+        parsed = parse_codex_rollout(path, home) if home else parse_transcript(path)
+        # remember the misses too. subagent forks and turn-less rollouts parse to
+        # nothing, and re-reading them (some are tens of MB) on every run was the
+        # single biggest cost in the index.
+        current[key] = parsed or Session(
+            path=key, mtime_ns=st.st_mtime_ns, size=st.st_size, session_id="", source=SKIP_SOURCE
+        )
+        changed = True
     if not rebuild and set(cached) != set(current):
         changed = True
     if changed:
         save_cache(cache_file, current)
-    return list(current.values())
+    return [s for s in current.values() if s.source != SKIP_SOURCE]
 
 
 def tokenize_query(query: str) -> tuple[list[str], list[str]]:
@@ -374,6 +547,130 @@ def _field_score(text: str, terms: list[str], phrases: list[str], weight: float)
     return score, evidence
 
 
+def _age_decay(session: Session) -> float:
+    try:
+        modified = datetime.fromisoformat(session.modified.replace("Z", "+00:00"))
+    except (ValueError, TypeError, AttributeError):
+        return 1.0
+    try:
+        age_days = max(0.0, (datetime.now(timezone.utc) - modified).total_seconds() / 86400.0)
+    except (OverflowError, OSError):
+        return 1.0
+    return math.exp(-age_days / 180.0)
+
+
+def _body_score(path: str, terms: list[str], phrases: list[str]) -> tuple[float, list[str]]:
+    """Grep one raw transcript. Catches text the index never stored."""
+    counts = {t: 0 for t in terms}
+    seen_phrases: set[str] = set()
+    patterns = {t: re.compile(rf"(?<![a-z0-9]){re.escape(t)}(?![a-z0-9])") for t in terms}
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                lower = line.lower()
+                for phrase in phrases:
+                    if phrase not in seen_phrases and phrase in lower:
+                        seen_phrases.add(phrase)
+                for term, pat in patterns.items():
+                    hits = len(pat.findall(lower))
+                    if hits:
+                        counts[term] += hits
+    except OSError:
+        return 0.0, []
+    score = 0.0
+    for phrase in seen_phrases:
+        score += BODY_WEIGHT * PHRASE_BONUS
+    for term, count in counts.items():
+        if count:
+            score += BODY_WEIGHT * (1.0 + math.log1p(count))
+    if not score:
+        return 0.0, []
+    matched = sorted(t for t, c in counts.items() if c)
+    label = "transcript body"
+    if seen_phrases:
+        label += ': phrase "' + sorted(seen_phrases)[0] + '"'
+    elif matched:
+        label += ": " + ", ".join(matched[:3])
+    return score, [label]
+
+
+def _shortlist_tool() -> list[str] | None:
+    """Pick the file-matcher. ripgrep is not a nicety here.
+
+    On 2.6 GB of transcripts, BSD grep -Fi takes ~39s and ripgrep ~0.5s, in any
+    locale. Without rg the deep scan is slow enough that the time budget cuts it
+    short and real matches get missed.
+    """
+    if shutil.which("rg"):
+        return ["rg", "-l", "-i", "-F", "--no-messages"]
+    if shutil.which("grep"):
+        return ["grep", "-lFi", "-s"]
+    return None
+
+
+def _grep_shortlist(paths: list[str], terms: list[str]) -> list[str] | None:
+    """Narrow the deep scan before paying for python scoring.
+
+    Multiple -e patterns give union semantics, matching what _body_score would
+    accept, and -l stops at the first hit in each file. Returns None when no
+    matcher is usable, so the caller falls back to scanning everything.
+    """
+    tool = _shortlist_tool()
+    if not paths or not terms or tool is None:
+        return None
+    probes: list[str] = []
+    for term in terms:
+        probes.extend(("-e", term))
+    keep: list[str] = []
+    chunk = 500
+    for start in range(0, len(paths), chunk):
+        batch = paths[start : start + chunk]
+        try:
+            proc = subprocess.run(
+                [*tool, *probes, "--", *batch],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if proc.returncode not in (0, 1):
+            return None
+        keep.extend(line for line in proc.stdout.splitlines() if line)
+    return keep
+
+
+def deep_search(
+    sessions: list[Session],
+    terms: list[str],
+    phrases: list[str],
+    *,
+    skip: set[str] | None = None,
+    budget: float = DEEP_TIME_BUDGET,
+) -> list[Hit]:
+    """Newest-first raw scan. Bounded by wall clock so it stays interactive."""
+    if not terms and not phrases:
+        return []
+    skip = skip or set()
+    deadline = time.monotonic() + budget
+    found: list[Hit] = []
+    ordered = [s for s in sorted(sessions, key=lambda s: s.modified, reverse=True) if s.session_id not in skip]
+    shortlist = _grep_shortlist([s.path for s in ordered], terms + phrases)
+    if shortlist is not None:
+        allowed = set(shortlist)
+        ordered = [s for s in ordered if s.path in allowed]
+    for sess in ordered:
+        if time.monotonic() > deadline:
+            break
+        score, evidence = _body_score(sess.path, terms, phrases)
+        if score <= 0:
+            continue
+        found.append(Hit(session=sess, score=score * _age_decay(sess), evidence=evidence))
+    found.sort(key=lambda h: h.score, reverse=True)
+    return found
+
+
 def score_session(session: Session, query: str, terms: list[str], phrases: list[str]) -> Hit:
     evidence: list[str] = []
     score = 0.0
@@ -396,12 +693,7 @@ def score_session(session: Session, query: str, terms: list[str], phrases: list[
         evidence.insert(0, "downranked (this looks like a find-session prompt)")
     if any(t in BUILD_TERMS for t in terms) and session.humans >= 8:
         score *= 1.0 + min(session.humans, 200) / 500.0
-    try:
-        modified = datetime.fromisoformat(session.modified.replace("Z", "+00:00"))
-        age_days = max(0.0, (datetime.now(timezone.utc) - modified).total_seconds() / 86400.0)
-        score *= math.exp(-age_days / 180.0)
-    except (ValueError, TypeError, OSError):
-        pass
+    score *= _age_decay(session)
     return Hit(session=session, score=score, evidence=evidence)
 
 
@@ -443,6 +735,10 @@ def search(
     hits = [score_session(s, query, terms, phrases) for s in scoped]
     hits = [h for h in hits if h.score > 0]
     hits.sort(key=lambda h: h.score, reverse=True)
+    if len(hits) < DEEP_MIN_HITS:
+        known = {h.session.session_id for h in hits}
+        hits.extend(deep_search(scoped, terms, phrases, skip=known))
+        hits.sort(key=lambda h: h.score, reverse=True)
     return hits[:limit], fell_back
 
 
@@ -465,6 +761,9 @@ def candidate_pool(
     for hit in scored:
         if hit.score > 0:
             by_id[hit.session.session_id] = hit
+    if len(by_id) < DEEP_MIN_HITS:
+        for hit in deep_search(scoped, terms, phrases, skip=set(by_id)):
+            by_id.setdefault(hit.session.session_id, hit)
     for sess in recent:
         by_id.setdefault(sess.session_id, Hit(session=sess, score=0.0))
     pool = list(by_id.values())
@@ -594,6 +893,21 @@ def build_picker_prompt(query: str, payload: list[dict], limit: int) -> str:
     )
 
 
+def picker_env() -> dict[str, str]:
+    """Run the picker on the personal account, not Vertex.
+
+    Vertex refuses the anthropic publisher models unless data sharing is
+    enabled on the GCP project, which kills ranking with a 403. Set
+    CLAUDE_RECALL_VERTEX=1 to keep whatever the shell already has.
+    """
+    env = os.environ.copy()
+    if env.get("CLAUDE_RECALL_VERTEX"):
+        return env
+    for name in VERTEX_ENV:
+        env.pop(name, None)
+    return env
+
+
 def claude_find(
     hits: list[Hit],
     query: str,
@@ -631,9 +945,7 @@ def claude_find(
         "--no-session-persistence",
         prompt,
     ]
-    model = os.environ.get("CLAUDE_RECALL_MODEL")
-    if model:
-        cmd[1:1] = ["--model", model]
+    cmd[1:1] = ["--model", os.environ.get("CLAUDE_RECALL_MODEL") or PICKER_MODEL]
     try:
         proc = subprocess.run(
             cmd,
@@ -641,6 +953,7 @@ def claude_find(
             capture_output=True,
             text=True,
             timeout=120,
+            env=picker_env(),
         )
     except subprocess.TimeoutExpired:
         return hits[:limit], "Claude timed out; falling back to keyword ranking."
@@ -684,6 +997,8 @@ def format_hits(hits: list[Hit], query: str) -> str:
         loc = loc.replace(str(Path.home()), "~")
         title = s.title or _one_line(s.first_prompt, 90) or "(no title)"
         branch = f"  [{s.branch}]" if s.branch else ""
+        if s.source != "claude":
+            branch += f"  ({s.source})"
         if hit.reason:
             lines.append(f"{i:>2}. {s.short_id}  {when}  {loc}{branch}")
         else:
@@ -695,7 +1010,7 @@ def format_hits(hits: list[Hit], query: str) -> str:
             lines.append(f"    {hit.reason}")
         elif hit.evidence:
             lines.append("    " + "; ".join(hit.evidence[:3]))
-        lines.append(f"    claude --resume {s.session_id}")
+        lines.append("    " + display_resume(s))
     return "\n".join(lines)
 
 
@@ -727,7 +1042,9 @@ def hits_json(hits: list[Hit], query: str, fell_back: bool) -> str:
                     "humans": h.session.humans,
                     "evidence": h.evidence,
                     "reason": h.reason,
-                    "resume": f"claude --resume {h.session.session_id}",
+                    "source": h.session.source,
+                    "agent_home": h.session.agent_home,
+                    "resume": display_resume(h.session),
                 }
                 for i, h in enumerate(hits, 1)
             ],
@@ -736,14 +1053,41 @@ def hits_json(hits: list[Hit], query: str, fell_back: bool) -> str:
     )
 
 
-def resume_session(session: Session, extra: list[str], *, fork: bool) -> int:
-    cwd = session.cwd if session.cwd and Path(session.cwd).is_dir() else os.getcwd()
+def resume_command(session: Session, *, fork: bool = False) -> list[str]:
+    if session.source == "codex":
+        return ["codex", "resume", session.session_id]
     args = ["claude", "--resume", session.session_id]
     if fork:
         args.append("--fork-session")
+    return args
+
+
+def resume_env(session: Session) -> dict[str, str]:
+    """Codex reads its store from CODEX_HOME; a non-default home must be named."""
+    if session.source != "codex" or not session.agent_home:
+        return {}
+    home = Path(session.agent_home)
+    if home == Path.home() / ".codex":
+        return {}
+    return {"CODEX_HOME": str(home)}
+
+
+def display_resume(session: Session, *, fork: bool = False) -> str:
+    cmd = shlex.join(resume_command(session, fork=fork))
+    env = resume_env(session)
+    prefix = "".join(f"{k}={shlex.quote(v)} " for k, v in env.items())
+    return prefix + cmd
+
+
+def resume_session(session: Session, extra: list[str], *, fork: bool) -> int:
+    cwd = session.cwd if session.cwd and Path(session.cwd).is_dir() else os.getcwd()
+    if fork and session.source == "codex":
+        print("codex has no --fork-session; resuming in place.", file=sys.stderr)
+    args = resume_command(session, fork=fork)
     args.extend(extra)
+    os.environ.update(resume_env(session))
     os.chdir(cwd)
-    os.execvp("claude", args)
+    os.execvp(args[0], args)
     return 1  # unreachable
 
 
@@ -798,6 +1142,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help=argparse.SUPPRESS,
     )
+    p.add_argument(
+        "--source",
+        choices=("all", "claude", "codex"),
+        default="all",
+        help="Which agent's sessions to search (default: all)",
+    )
     p.add_argument("--fork", action="store_true", help="Pass --fork-session when resuming")
     p.add_argument("--reindex", action="store_true", help="Rebuild the session index")
     p.add_argument("--print-cmd", action="store_true", help="Print the resume command instead of execing")
@@ -823,7 +1173,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"No Claude Code sessions found at {root}", file=sys.stderr)
         return 2
 
-    sessions = build_index(root, cache_path(), rebuild=args.reindex)
+    homes = [] if args.source == "claude" else codex_homes()
+    sessions = build_index(root, cache_path(), rebuild=args.reindex, codex_homes=homes)
+    if args.source != "all":
+        sessions = [s for s in sessions if s.source == args.source]
     if args.reindex and not query:
         print(f"Indexed {len(sessions)} sessions.")
         return 0
@@ -899,12 +1252,12 @@ def main(argv: list[str] | None = None) -> int:
     if chosen is None:
         return 0
 
-    cmd = ["claude", "--resume", chosen.session.session_id]
-    if args.fork:
-        cmd.append("--fork-session")
-    cmd.extend(extra)
     if args.print_cmd:
-        print(shlex.join(cmd))
+        cmd = resume_command(chosen.session, fork=args.fork)
+        cmd.extend(extra)
+        env = resume_env(chosen.session)
+        prefix = "".join(f"{k}={shlex.quote(v)} " for k, v in env.items())
+        print(prefix + shlex.join(cmd))
         return 0
     print(f"Resuming {chosen.session.session_id} in {chosen.session.cwd or '.'}", file=sys.stderr)
     return resume_session(chosen.session, extra, fork=args.fork)
