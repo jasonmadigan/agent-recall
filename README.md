@@ -9,8 +9,6 @@ agent-recall "auth middleware" --pick
 
 Searches **Claude Code, Codex, OpenCode, and Pi** history on your machine. Python 3.9+ is the only runtime requirement. Search runs locally; an agent CLI is only required to resume its sessions or to request optional Claude ranking.
 
-Previously **Claude Recall**. The `ccrecall` command and `CLAUDE_RECALL_*` settings still work. See [migration](#migrating-from-claude-recall).
-
 ## Install
 
 ```bash
@@ -139,14 +137,6 @@ Default CLI search invokes no model and sends no transcript text over the networ
 Using the skill places those excerpts in your current agent conversation, subject to that agent's provider and privacy settings.
 
 Exit codes: `0` for results or a successful reindex, `1` for no match or an ambiguous ID, `2` for invalid CLI options/settings or a missing resume executable. Choosing not to resume exits successfully.
-
-## Migrating from Claude Recall
-
-- Update your Git remote to `git@github.com:jasonmadigan/agent-recall.git` and rerun `./install.sh`.
-- `ccrecall` and `python3 claude_recall.py` remain compatibility entry points. Python imports of `claude_recall` also work.
-- The CLI now defaults to local ranking. Add `--ranker claude` to retain the old model-ranking behavior; the legacy `--llm` flag also works.
-- Existing `CLAUDE_RECALL_*` overrides still apply. Without an explicit cache override, the new cache is built automatically; the old `~/.cache/claude-recall` directory can be removed.
-- Claude plugin users should register the renamed marketplace and install `find-session@agent-recall`.
 
 ## Development
 
